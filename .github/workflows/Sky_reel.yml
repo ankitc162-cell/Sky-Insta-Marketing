@@ -1,0 +1,86 @@
+name: Sky Insta Reel
+
+on:
+  schedule:
+    # Runs every day at 09:00 UTC (2:30 PM IST) — adjust as you like
+    - cron: "0 9 * * *"
+  workflow_dispatch:   # allows manual trigger from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  post-reel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout repo ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Restore day counter from cache ───────────────────────────────────
+      - name: Restore day counter
+        id: cache-day
+        uses: actions/cache@v4
+        with:
+          path: day_counter.txt
+          key: day-counter-${{ github.run_number }}
+          restore-keys: |
+            day-counter-
+
+      - name: Read or initialise day counter
+        id: day
+        run: |
+          if [ -f day_counter.txt ]; then
+            DAY=$(cat day_counter.txt)
+          else
+            DAY=1
+          fi
+          echo "DAY_NUMBER=$DAY" >> $GITHUB_ENV
+          echo "Current day: $DAY"
+
+      # ── 3. System deps (fonts + ffmpeg for moviepy) ──────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg fonts-dejavu-core imagemagick
+
+      # ── 4. Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Run the bot ───────────────────────────────────────────────────────
+      - name: Generate and post reel
+        env:
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          INSTAGRAM_USER_ID:      ${{ secrets.INSTAGRAM_USER_ID }}
+          GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
+          PEXELS_API_KEY:         ${{ secrets.PEXELS_API_KEY }}
+          GITHUB_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:      ${{ github.repository }}
+          DAY_NUMBER:             ${{ env.DAY_NUMBER }}
+        run: python generate_and_post.py
+
+      # ── 6. Increment & save day counter ─────────────────────────────────────
+      - name: Save incremented day counter
+        if: success()
+        run: |
+          NEXT_DAY=$((DAY_NUMBER + 1))
+          echo $NEXT_DAY > day_counter.txt
+          echo "Next run will be Day $NEXT_DAY"
+
+      - name: Commit day counter update
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add day_counter.txt
+          git diff --staged --quiet || git commit -m "chore: increment day counter to $((DAY_NUMBER + 1))"
+          git push
