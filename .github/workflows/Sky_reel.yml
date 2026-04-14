@@ -1,5 +1,4 @@
 name: Sky Travel Reel
-
 on:
   workflow_dispatch:
     inputs:
@@ -36,9 +35,22 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Generate travel reel and send to Telegram
+        # FIX: Pass destination via env var to avoid shell injection
+        # FIX: OPENAI_API_KEY added so ChatGPT fallback actually works
         env:
+          DESTINATION: ${{ github.event.inputs.destination }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python generate_travel_reel.py "${{ github.event.inputs.destination }}"
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python generate_travel_reel.py
+
+      # FIX: Upload reel as artifact so it's recoverable if Telegram send fails
+      - name: Upload reel as artifact (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: travel-reel-${{ github.event.inputs.destination }}
+          path: reel.mp4
+          retention-days: 3
