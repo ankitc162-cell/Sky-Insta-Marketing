@@ -26,6 +26,11 @@ from moviepy.editor import (
 )
 from moviepy.video.fx.all import crop, resize
 
+# FIX: Patch removed Pillow constant for MoviePy 1.0.3 compatibility
+import PIL.Image
+if not hasattr(PIL.Image, "ANTIALIAS"):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
+
 # --- Constants ---
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -67,7 +72,7 @@ def send_video_telegram(video_path: str, caption: str = ""):
 # --- Script Generation ---
 def _build_prompt(destination: str) -> str:
     return (
-        "Aap ek premium travel company 'Sky Safar Tourism Private Limited' ke liye Instagram Reels scriptwriter hain.\n"
+        "Aap ek premium travel company 'Sky Safr Tourism Private Limited' ke liye Instagram Reels scriptwriter hain.\n"
         f"Aaj hum destination \"{destination}\" par ek exciting reel banayenge.\n\n"
         f"Ek Hindi voiceover script likho jo {destination} ke top tourist spots, unki khoobsurti, aur wahan jaane ke reasons ko highlight kare.\n"
         "Script exciting aur inviting tone mein honi chahiye, jaise ek tour guide apne guests ko roam karwa raha ho.\n\n"
@@ -75,11 +80,11 @@ def _build_prompt(destination: str) -> str:
         "Sirf valid JSON return karo is exact format mein:\n"
         '{{"script": "Poora voiceover script yahan...", "segments": [{{"description": "Is part mein kya dikhaya ja raha hai", "keywords": "pexels search term in English"}}, ...]}}\n\n'
         "Script rules:\n"
-        f"- Shuru karo: 'Sky Safar Tourism ke saath aaj hum aapko le ja rahe hain {destination} ki yaadgaar yatra par!'\n"
+        f"- Shuru karo: 'Sky Safr Tourism ke saath aaj hum aapko le ja rahe hain {destination} ki yaadgaar yatra par!'\n"
         f"- {destination} ke 4-6 sabse famous aur beautiful tourist spots ko cover karo.\n"
         "- Har spot ke baare mein 2-3 sentences bolo — uska khaas attraction kya hai, kyun visit karna chahiye.\n"
         "- Exciting adjectives use karo: 'shaandar', 'manmohak', 'adbhut', 'swarg se kam nahi'.\n"
-        "- Ant mein kaho: 'Toh der kis baat ki? Abhi contact karein Sky Safar Tourism Private Limited ko 9654100207 par aur book karein apna dream trip {destination} ka!'\n"
+        "- Ant mein kaho: 'Toh der kis baat ki? Abhi contact karein Sky Safr Tourism Private Limited ko 9654100207 par aur book karein apna dream trip {destination} ka!'\n"
         "- Total script 200-250 words. Natural, flowing Hindi.\n\n"
         "Keywords rules:\n"
         "- Har tourist spot ya visual vibe ke liye ek segment banao.\n"
@@ -185,6 +190,16 @@ def fetch_pexels_video(query: str, output_path: str, max_retries: int = 2):
     with open(output_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
+
+    # FIX: Validate the downloaded file is a real, openable video before returning
+    try:
+        test_clip = VideoFileClip(output_path)
+        test_clip.close()
+    except Exception as e:
+        print(f"[WARN] Downloaded video is invalid ({e}), skipping.")
+        os.remove(output_path)
+        return None
+
     return output_path
 
 # --- Voiceover Generation (Gemini TTS - Erinome) ---
@@ -194,7 +209,6 @@ def generate_voiceover(script: str, output_path: str = "voiceover.mp3") -> str:
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # FIX: Use typed GenerateContentConfig instead of raw dict
     response = client.models.generate_content(
         model="gemini-2.5-flash-preview-tts",
         contents=script,
@@ -263,7 +277,6 @@ def make_destination_overlay(destination: str, duration: float):
     dest_text = make_text_image(destination, 80, "#FFC800")
     img_clip = ImageClip(dest_text)
     img_w = dest_text.shape[1]
-    # FIX: Calculate absolute pixel position instead of using relative=True
     x_pos = (REEL_W - img_w) // 2
     y_pos = int(REEL_H * 0.25)
     dest_clip = img_clip.set_duration(duration).set_position((x_pos, y_pos))
@@ -294,7 +307,14 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
     for i, seg in enumerate(segments):
         clip_path = f"clip_{i}.mp4"
         clip_paths.append(clip_path)
+
+        # FIX: Retry with a broader fallback keyword if first fetch failed
         pexels_path = fetch_pexels_video(seg["keywords"], clip_path)
+        if not pexels_path:
+            fallback_keyword = seg["keywords"].split(",")[0].split()[0]
+            print(f"[INFO] Retrying segment {i} with fallback keyword: '{fallback_keyword}'")
+            pexels_path = fetch_pexels_video(fallback_keyword, clip_path)
+
         raw = None
         if pexels_path:
             try:
@@ -334,14 +354,12 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
         ]
     )
 
-    # FIX: Close clips to release file handles before deleting
     audio.close()
     final.close()
     base_video.close()
     for clip in clips:
         clip.close()
 
-    # FIX: Clean up downloaded clip files
     for path in clip_paths:
         if os.path.exists(path):
             os.remove(path)
@@ -379,16 +397,15 @@ def main():
         build_video(data, audio_path, DESTINATION, video_path)
 
         caption = (
-            f"✨ {DESTINATION} awaits you with Sky Safar Tourism! ✨\n\n"
+            f"✨ {DESTINATION} awaits you with Sky Safr Tourism! ✨\n\n"
             f"Discover the magic of {DESTINATION} — from breathtaking landscapes to rich culture.\n\n"
             f"📞 Contact us: 9654100207\n"
             f"📌 Save this reel and start planning your next adventure!\n\n"
-            f"#SkySafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
+            f"#SkySafrTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
         )
         send_video_telegram(video_path, caption)
         print("\n✅ Done! Reel sent to Telegram.")
     finally:
-        # FIX: Always clean up temp files after run (audio + reel)
         cleanup_temp_files(audio_path, video_path)
 
 if __name__ == "__main__":
