@@ -5,6 +5,7 @@ Travel Destination Reel Generator
 - Fetches unique Pexels video clips for each segment
 - Builds 9:16 reel with destination overlay
 - Sends final video to Telegram chat
+- Falls back to ChatGPT if Gemini text generation fails
 """
 
 import os
@@ -13,6 +14,7 @@ import time
 import requests
 import random
 import json
+import openai
 from google import genai
 from pathlib import Path
 from datetime import datetime
@@ -24,6 +26,7 @@ from moviepy.video.fx.all import crop, resize
 
 # --- Constants ---
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 PEXELS_API_KEY = os.environ["PEXELS_API_KEY"]
 REEL_W, REEL_H = 1080, 1920
 
@@ -90,20 +93,39 @@ def _parse_response(text):
     return json.loads(text)
 
 def generate_script(destination: str) -> dict:
-    client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = _build_prompt(destination)
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-            data = _parse_response(response.text)
-            print(f"[INFO] Script generated ({len(data['script'].split())} words, {len(data['segments'])} segments)")
-            return data
-        except Exception as e:
-            if attempt == 2:
-                raise
-            print(f"[WARN] Gemini attempt {attempt+1} failed, retrying in 10s...")
-            time.sleep(10)
-    raise RuntimeError("Gemini failed after 3 attempts")
+
+    # 1. Try Gemini first
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+        data = _parse_response(response.text)
+        print(f"[INFO] Script generated using Gemini ({len(data['script'].split())} words, {len(data['segments'])} segments)")
+        return data
+    except Exception as e:
+        print(f"[WARN] Gemini failed: {e}. Falling back to ChatGPT...")
+
+    # 2. Fallback to ChatGPT
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Gemini failed and OPENAI_API_KEY not set.")
+    try:
+        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that outputs only valid JSON in the exact format requested."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        response_text = response.choices[0].message.content
+        data = _parse_response(response_text)
+        print(f"[INFO] Script generated using ChatGPT ({len(data['script'].split())} words, {len(data['segments'])} segments)")
+        return data
+    except Exception as e:
+        print(f"[ERROR] ChatGPT also failed: {e}")
+        raise RuntimeError("Both Gemini and ChatGPT failed to generate script.")
 
 # --- Pexels Video Fetch (with deduplication) ---
 used_video_ids = set()
