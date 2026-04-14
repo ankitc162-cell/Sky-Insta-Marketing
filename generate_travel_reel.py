@@ -94,7 +94,7 @@ def generate_script(destination: str) -> dict:
     prompt = _build_prompt(destination)
     for attempt in range(3):
         try:
-            response = client.models.generate_content(model="gemini-2.0-flash-exp", contents=prompt)
+            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
             data = _parse_response(response.text)
             print(f"[INFO] Script generated ({len(data['script'].split())} words, {len(data['segments'])} segments)")
             return data
