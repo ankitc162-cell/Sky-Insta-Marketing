@@ -94,20 +94,23 @@ def _parse_response(text):
 
 def generate_script(destination: str) -> dict:
     prompt = _build_prompt(destination)
+    gemini_models = ["gemini-2.0-flash", "gemini-2.5-flash"]
 
-    # 1. Try Gemini first
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-        data = _parse_response(response.text)
-        print(f"[INFO] Script generated using Gemini ({len(data['script'].split())} words, {len(data['segments'])} segments)")
-        return data
-    except Exception as e:
-        print(f"[WARN] Gemini failed: {e}. Falling back to ChatGPT...")
+    # Try Gemini models in sequence
+    for model in gemini_models:
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            print(f"[INFO] Trying Gemini model: {model}")
+            response = client.models.generate_content(model=model, contents=prompt)
+            data = _parse_response(response.text)
+            print(f"[INFO] Script generated using Gemini {model} ({len(data['script'].split())} words, {len(data['segments'])} segments)")
+            return data
+        except Exception as e:
+            print(f"[WARN] Gemini {model} failed: {e}")
 
-    # 2. Fallback to ChatGPT
+    # Fallback to ChatGPT
     if not OPENAI_API_KEY:
-        raise RuntimeError("Gemini failed and OPENAI_API_KEY not set.")
+        raise RuntimeError("All Gemini models failed and OPENAI_API_KEY not set.")
     try:
         openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
         response = openai_client.chat.completions.create(
