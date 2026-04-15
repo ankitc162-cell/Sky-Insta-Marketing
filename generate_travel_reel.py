@@ -254,7 +254,7 @@ def verify_video_content_gemini(video_path: str, expected_landmark: str, destina
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = f"Does this image show {expected_landmark} in {destination}? Answer only 'yes' or 'no'."
         response = client.models.generate_content(
-            model="gemini-2.0-flash-exp",
+            model="gemini-2.0-flash",
             contents=[prompt, img]
         )
         answer = response.text.strip().lower()
