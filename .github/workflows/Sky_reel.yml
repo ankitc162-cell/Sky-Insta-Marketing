@@ -28,6 +28,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+          pip install setuptools-rust
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -39,8 +40,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Generate travel reel and send to Telegram
-        # FIX: Pass destination via env var to avoid shell injection
-        # FIX: OPENAI_API_KEY added so ChatGPT fallback actually works
         env:
           DESTINATION: ${{ github.event.inputs.destination }}
           AUDIENCE_TYPE: ${{ github.event.inputs.audience_type }}
@@ -51,7 +50,6 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python generate_travel_reel.py
 
-      # FIX: Upload reel as artifact so it's recoverable if Telegram send fails
       - name: Upload reel as artifact (fallback)
         if: always()
         uses: actions/upload-artifact@v4
