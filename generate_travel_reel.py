@@ -4,7 +4,7 @@ Travel Destination Reel Generator
 - Generates story-driven Hindi voiceover with scroll-stopping hook via Gemini TTS (Erinome)
 - Fetches Pexels video clips with cinematic keyword hints (disk cached)
 - Builds 9:16 reel with semi-transparent destination overlay + company logo at end
-- Mixes viral-style background music at 30% volume
+- Mixes viral-style background music at 15% volume
 - Sends final video to Telegram
 - Falls back to ChatGPT if Gemini text generation fails
 """
@@ -47,12 +47,11 @@ CACHE_DIR       = Path(os.environ.get("PEXELS_CACHE_DIR", "/tmp/pexels_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 BG_MUSIC_PATH   = os.environ.get("BG_MUSIC_PATH", "bg_music.mp3")
-BG_MUSIC_VOLUME = 0.30          # 30% volume
+BG_MUSIC_VOLUME = 0.15          # 15% volume
 VOICEOVER_SPEED = 1.10          # 10% faster
 LOGO_PATH       = os.environ.get("LOGO_PATH", "logo.png")  # company logo file
 
 # Pixabay viral music fallback URLs (royalty-free, no attribution required)
-# These are cinematic/travel vibes commonly used in viral reels
 VIRAL_MUSIC_OPTIONS = [
     "https://cdn.pixabay.com/download/audio/2024/03/13/audio_3d5b6e6e21.mp3",  # Epic Cinematic
     "https://cdn.pixabay.com/download/audio/2023/06/05/audio_0bbfe02b94.mp3",  # Travel Vlog
@@ -133,10 +132,10 @@ def _build_prompt(destination: str, audience_type: str) -> str:
         "  - Example: 'Yeh sirf ek jagah nahi, ek ehsaas hai jo zindagi bhar yaad rahega'\n\n"
 
         "CTA (urgent + emotional, NOT just functional):\n"
-        "  - Pehle urgency/FOMO: 'Seats limited hain — aur aisi jagah baar-baar nahi milti...'\n"
+        "  - Pehle urgency/FOMO: 'offers limited hain — aur aisi jagah baar-baar nahi milti...'\n"
         f"  - Phir: 'Abhi contact karein Sky Suffer Tourism Private Limited ko 9654100207 par aur book karein apna dream trip {destination} ka!'\n\n"
 
-        "  - Total script 220-260 words. Natural, flowing Hindi. Hook included in word count.\n\n"
+        "  - Total script 160-180 words. Natural, flowing Hindi. Hook included in word count.\n\n"
 
         "=== KEYWORDS RULES ===\n"
         "  - Har segment ke liye cinematic-style 3-5 word Pexels search terms\n"
@@ -234,23 +233,26 @@ def load_bg_music(duration: float):
         print(f"[WARN] Could not load background music: {e}")
         return None
 
-# --- Pexels Video Fetch ---
+# --- Pexels Video Fetch (with validation and retry) ---
 used_video_ids = set()
 
 def _cache_filename(video_id: int, width: int) -> Path:
     return CACHE_DIR / f"{video_id}_{width}.mp4"
 
-def _is_valid_clip(path: str) -> bool:
+def _is_valid_video_file(path: str) -> bool:
+    """Check if video file is playable using ffprobe."""
     try:
-        clip = VideoFileClip(path)
-        clip.get_frame(0)
-        clip.close()
-        return True
-    except Exception as e:
-        print(f"[WARN] Clip validation failed for {path}: {e}")
+        import imageio_ffmpeg
+        ffprobe_bin = imageio_ffmpeg.get_ffmpeg_exe().replace("ffmpeg", "ffprobe")
+        result = subprocess.run(
+            [ffprobe_bin, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=10
+        )
+        return "video" in result.stdout
+    except Exception:
         return False
 
-def fetch_pexels_video(query: str, output_path: str, max_retries: int = 2):
+def fetch_pexels_video(query: str, output_path: str, max_retries: int = 3):
     headers = {"Authorization": PEXELS_API_KEY}
     videos = []
 
@@ -286,8 +288,9 @@ def fetch_pexels_video(query: str, output_path: str, max_retries: int = 2):
     available = [v for v in videos if v["id"] not in used_video_ids]
     if not available:
         available = videos
+        print(f"[INFO] All videos for '{query}' already used; allowing reuse.")
 
-    candidates = available[:5]
+    candidates = available[:8]
     random.shuffle(candidates)
 
     for video in candidates:
@@ -298,7 +301,7 @@ def fetch_pexels_video(query: str, output_path: str, max_retries: int = 2):
 
         cache_file = _cache_filename(video["id"], chosen_width)
         if cache_file.exists():
-            if _is_valid_clip(str(cache_file)):
+            if _is_valid_video_file(str(cache_file)):
                 print(f"[CACHE HIT] {query} -> {cache_file.name}")
                 shutil.copy2(str(cache_file), output_path)
                 return output_path
@@ -316,16 +319,16 @@ def fetch_pexels_video(query: str, output_path: str, max_retries: int = 2):
             print(f"[WARN] Download failed for video {video['id']}: {e}")
             continue
 
-        if not _is_valid_clip(output_path):
+        if not _is_valid_video_file(output_path):
             os.remove(output_path)
-            print(f"[WARN] Video {video['id']} failed frame validation, trying next...")
+            print(f"[WARN] Video {video['id']} is corrupt, trying next candidate...")
             continue
 
         shutil.copy2(output_path, str(cache_file))
         print(f"[CACHE SAVE] {cache_file.name}")
         return output_path
 
-    print(f"[WARN] All candidates failed for '{query}'")
+    print(f"[ERROR] All candidate videos for '{query}' failed. Returning None.")
     return None
 
 # --- Voiceover Generation ---
@@ -390,7 +393,6 @@ def make_text_image(text, fontsize, color, stroke_color="black", stroke_width=3,
     img  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Parse color string to RGB and apply alpha
     if isinstance(color, str) and color.startswith("#"):
         r = int(color[1:3], 16)
         g = int(color[3:5], 16)
@@ -407,43 +409,68 @@ def make_text_image(text, fontsize, color, stroke_color="black", stroke_width=3,
     return np.array(img)
 
 def make_destination_overlay(destination: str, duration: float):
-    # 50% transparent: alpha=128 out of 255
-    dest_arr = make_text_image(destination, 80, "#FFC800", alpha=128)
-    img_clip  = ImageClip(dest_arr)
-    img_w     = dest_arr.shape[1]
-    x_pos     = (REEL_W - img_w) // 2
-    y_pos     = int(REEL_H * 0.25)
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    ]
+    font = None
+    for fp in font_paths:
+        if os.path.exists(fp):
+            font = ImageFont.truetype(fp, 75)
+            break
+    if font is None:
+        font = ImageFont.load_default()
+
+    spaced_text = " ".join(destination.upper())
+
+    dummy = Image.new("RGBA", (1, 1))
+    draw = ImageDraw.Draw(dummy)
+    bbox = draw.textbbox((0, 0), spaced_text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    pad = 30
+    img = Image.new("RGBA", (text_w + 2 * pad, text_h + 2 * pad), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    fill_color = (255, 255, 255, 179)
+    stroke_color = (200, 200, 200, 179)
+    stroke_width = 2
+
+    for dx in range(-stroke_width, stroke_width + 1):
+        for dy in range(-stroke_width, stroke_width + 1):
+            draw.text((pad + dx, pad + dy), spaced_text, font=font, fill=stroke_color)
+    draw.text((pad, pad), spaced_text, font=font, fill=fill_color)
+
+    y_pos = int(REEL_H * 0.10)
+    x_pos = (REEL_W - img.width) // 2
+
+    img_clip = ImageClip(np.array(img))
     return [img_clip.set_duration(duration).set_position((x_pos, y_pos))]
 
-def make_logo_overlay(duration: float, logo_start: float):
-    """Load logo.png and display it in the bottom-right corner during the last segment."""
+def make_logo_overlay(duration: float):
     if not os.path.exists(LOGO_PATH):
-        print(f"[WARN] Logo not found at '{LOGO_PATH}', skipping logo overlay.")
+        print(f"[WARN] Logo not found at '{LOGO_PATH}', skipping.")
         return []
     try:
         from PIL import Image
         import numpy as np
         logo_img = Image.open(LOGO_PATH).convert("RGBA")
-
-        # Resize logo to max 220px wide, keep aspect ratio
-        max_w = 220
-        ratio  = max_w / logo_img.width
-        new_h  = int(logo_img.height * ratio)
-        logo_img = logo_img.resize((max_w, new_h), PIL.Image.LANCZOS)
+        max_h = 100
+        ratio = max_h / logo_img.height
+        new_w = int(logo_img.width * ratio)
+        logo_img = logo_img.resize((new_w, max_h), PIL.Image.LANCZOS)
         logo_arr = np.array(logo_img)
 
         logo_clip = ImageClip(logo_arr)
-        logo_duration = duration - logo_start
-        x_pos = REEL_W - max_w - 40   # 40px from right edge
-        y_pos = REEL_H - new_h - 80   # 80px from bottom
+        x_pos = (REEL_W - new_w) // 2
+        y_pos = REEL_H - max_h - 40
 
-        logo_clip = (
-            logo_clip
-            .set_start(logo_start)
-            .set_duration(logo_duration)
-            .set_position((x_pos, y_pos))
-        )
-        print(f"[INFO] Logo overlay: appears at {logo_start:.1f}s, bottom-right corner")
+        logo_clip = logo_clip.set_duration(duration).set_position((x_pos, y_pos))
+        print(f"[INFO] Logo overlay: centered bottom, entire duration")
         return [logo_clip]
     except Exception as e:
         print(f"[WARN] Could not load logo: {e}")
@@ -477,10 +504,17 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
         clip_paths.append(clip_path)
 
         pexels_path = fetch_pexels_video(seg["keywords"], clip_path)
+
         if not pexels_path:
-            fallback = seg["keywords"].split()[0]
-            print(f"[INFO] Retrying segment {i} with fallback keyword: '{fallback}'")
-            pexels_path = fetch_pexels_video(fallback, clip_path)
+            spot_hint = seg.get("description", "").split()[0] if seg.get("description") else ""
+            fallback1 = f"{destination} {spot_hint}".strip()
+            print(f"[INFO] Segment {i} primary failed. Trying: '{fallback1}'")
+            pexels_path = fetch_pexels_video(fallback1, clip_path)
+
+        if not pexels_path:
+            fallback2 = f"{destination} travel"
+            print(f"[INFO] Still no clip. Trying: '{fallback2}'")
+            pexels_path = fetch_pexels_video(fallback2, clip_path)
 
         raw = None
         if pexels_path:
@@ -488,21 +522,20 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
                 raw = VideoFileClip(pexels_path)
                 raw.get_frame(0)
                 if raw.duration < seg_duration:
-                    loops  = int(seg_duration / raw.duration) + 1
-                    looped = concatenate_videoclips([raw] * loops)
-                    raw.close()
-                    raw = looped
+                    loops = int(seg_duration / raw.duration) + 1
+                    raw = concatenate_videoclips([raw] * loops)
                 raw = raw.subclip(0, seg_duration)
                 raw = crop_to_portrait(raw).without_audio()
             except Exception as e:
-                print(f"[WARN] Clip {i} build failed: {e}, using color fallback")
+                print(f"[WARN] Clip {i} processing failed: {e}, using color fallback")
                 try:
                     if raw:
                         raw.close()
-                except Exception:
+                except:
                     pass
                 raw = ColorClip(size=(REEL_W, REEL_H), color=(15, 15, 30)).set_duration(seg_duration)
         else:
+            print(f"[WARN] All destination‑specific queries failed for segment {i}. Using color clip.")
             raw = ColorClip(size=(REEL_W, REEL_H), color=(15, 15, 30)).set_duration(seg_duration)
 
         overlay = ColorClip(size=(REEL_W, REEL_H), color=(0, 0, 0)).set_opacity(0.45).set_duration(seg_duration)
@@ -510,13 +543,10 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
 
     base_video = concatenate_videoclips(clips, method="compose")
 
-    # Overlays: destination text (always) + logo (last 2 segments)
     dest_overlays = make_destination_overlay(destination, duration)
-    logo_start    = duration - (seg_duration * 2)          # appears in final 2 segments
-    logo_overlays = make_logo_overlay(duration, max(logo_start, 0))
+    logo_overlays = make_logo_overlay(duration)
     all_overlays  = dest_overlays + logo_overlays
 
-    # Audio: voiceover + background music
     bg_music    = load_bg_music(duration)
     final_audio = CompositeAudioClip([voiceover, bg_music]) if bg_music else voiceover
 
@@ -543,7 +573,7 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
     for clip in clips:
         try:
             clip.close()
-        except Exception:
+        except:
             pass
     for path in clip_paths:
         if os.path.exists(path):
@@ -588,7 +618,7 @@ def main():
             f"Discover the magic of {DESTINATION} — from breathtaking landscapes to rich culture.\n\n"
             f"📞 Contact us: 9654100207\n"
             f"📌 Save this reel and start planning your next adventure!\n\n"
-            f"#SkySafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
+            f"#SkysafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
         )
         send_video_telegram(video_path, caption)
         print("\n✅ Done! Reel sent to Telegram.")
