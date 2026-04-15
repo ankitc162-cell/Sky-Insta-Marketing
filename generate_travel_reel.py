@@ -2,8 +2,8 @@
 Travel Destination Reel Generator
 - Accepts destination name + optional audience type as CLI args
 - Generates story-driven Hindi voiceover with scroll-stopping hook via Gemini TTS (Erinome)
-- Fetches Pexels video clips with cinematic keyword hints (disk cached)
-- Falls back to Pexels images with Ken Burns zoom if videos fail
+- Fetches destination-specific Pexels video clips (prefixed with destination name)
+- Falls back to destination-specific Pexels images with Ken Burns zoom if videos fail
 - Builds 9:16 reel with semi-transparent destination overlay + company logo throughout
 - Mixes viral-style background music at 15% volume
 - Sends final video to Telegram
@@ -140,7 +140,7 @@ def _build_prompt(destination: str, audience_type: str) -> str:
 
         "=== KEYWORDS RULES ===\n"
         "  - Har segment ke liye cinematic-style 3-5 word Pexels search terms\n"
-        "  - Include camera style + mood: 'drone mountain sunrise mist', 'slow motion waterfall forest'\n"
+        "  - Keywords MUST be specific to the destination/spot (e.g., 'Bhutan Paro Taktsang', 'Thimphu Buddha Dordenma')\n"
         "  - Keywords ENGLISH mein only\n\n"
 
         "=== MUSIC VIBE ===\n"
@@ -234,7 +234,24 @@ def load_bg_music(duration: float):
         print(f"[WARN] Could not load background music: {e}")
         return None
 
-# --- Pexels Video Fetch (without validation) ---
+# --- Helper: Build destination-specific query ---
+def build_destination_query(base_query: str, destination: str, extra: str = "") -> str:
+    """Ensure the query contains the destination name."""
+    if extra:
+        combined = f"{destination} {base_query} {extra}".strip()
+    else:
+        combined = f"{destination} {base_query}".strip()
+    # Remove duplicate destination if already present
+    parts = combined.split()
+    seen = set()
+    unique_parts = []
+    for p in parts:
+        if p.lower() not in seen:
+            seen.add(p.lower())
+            unique_parts.append(p)
+    return " ".join(unique_parts)
+
+# --- Pexels Video Fetch ---
 used_video_ids = set()
 
 def _cache_filename(video_id: int, width: int) -> Path:
@@ -334,7 +351,6 @@ def fetch_pexels_image(query: str, output_path: str):
         print(f"[WARN] No images found for '{query}'")
         return None
 
-    # Filter out used IDs
     available = [p for p in photos if p["id"] not in used_image_ids]
     if not available:
         available = photos
@@ -513,7 +529,6 @@ def crop_to_portrait(clip):
 def apply_ken_burns(clip, duration, zoom_ratio=1.1):
     """Apply a subtle zoom-in effect to an image clip."""
     def make_frame(t):
-        # Zoom from 1.0 to zoom_ratio over duration
         scale = 1 + (zoom_ratio - 1) * t / duration
         frame = clip.get_frame(t)
         from PIL import Image
@@ -522,7 +537,6 @@ def apply_ken_burns(clip, duration, zoom_ratio=1.1):
         new_w = int(clip.w * scale)
         new_h = int(clip.h * scale)
         resized = pil_img.resize((new_w, new_h), PIL.Image.LANCZOS)
-        # Crop center to original size
         left = (new_w - clip.w) // 2
         top = (new_h - clip.h) // 2
         cropped = resized.crop((left, top, left + clip.w, top + clip.h))
@@ -547,24 +561,31 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
         temp_files.append(clip_path)
         temp_files.append(img_path)
 
+        # Extract base keywords from LLM (may or may not contain destination)
+        base_keywords = seg["keywords"]
+
+        # Build destination-prefixed queries
+        primary_query = build_destination_query(base_keywords, destination)
+        spot_hint = seg.get("description", "").split()[0] if seg.get("description") else ""
+        fallback_query = build_destination_query(spot_hint, destination) if spot_hint else primary_query
+
         visual_clip = None
 
-        # Attempt 1: Primary video query
-        pexels_path = fetch_pexels_video(seg["keywords"], clip_path)
+        # Attempt 1: Primary video query (destination-prefixed)
+        print(f"[INFO] Segment {i}: searching videos for '{primary_query}'")
+        pexels_path = fetch_pexels_video(primary_query, clip_path)
         if pexels_path:
             try:
                 visual_clip = VideoFileClip(pexels_path)
-                visual_clip.get_frame(0)  # test validity
+                visual_clip.get_frame(0)
             except Exception as e:
                 print(f"[WARN] Video clip {i} unplayable: {e}")
                 visual_clip = None
 
-        # Attempt 2: Fallback video query with destination + spot
-        if not visual_clip:
-            spot_hint = seg.get("description", "").split()[0] if seg.get("description") else ""
-            fallback1 = f"{destination} {spot_hint}".strip()
-            print(f"[INFO] Segment {i} video failed. Trying fallback query: '{fallback1}'")
-            pexels_path = fetch_pexels_video(fallback1, clip_path)
+        # Attempt 2: Fallback video query (destination + spot)
+        if not visual_clip and fallback_query != primary_query:
+            print(f"[INFO] Segment {i} primary video failed. Trying fallback: '{fallback_query}'")
+            pexels_path = fetch_pexels_video(fallback_query, clip_path)
             if pexels_path:
                 try:
                     visual_clip = VideoFileClip(pexels_path)
@@ -573,24 +594,10 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
                     print(f"[WARN] Fallback video unplayable: {e}")
                     visual_clip = None
 
-        # Attempt 3: Last video fallback: destination + "travel"
-        if not visual_clip:
-            fallback2 = f"{destination} travel"
-            print(f"[INFO] Still no video. Trying: '{fallback2}'")
-            pexels_path = fetch_pexels_video(fallback2, clip_path)
-            if pexels_path:
-                try:
-                    visual_clip = VideoFileClip(pexels_path)
-                    visual_clip.get_frame(0)
-                except Exception as e:
-                    print(f"[WARN] Last video fallback unplayable: {e}")
-                    visual_clip = None
-
-        # Attempt 4: Image fallback
+        # Attempt 3: Image fallback (destination-prefixed queries)
         if not visual_clip:
             print(f"[INFO] All video attempts failed. Fetching image for segment {i}.")
-            # Try the same query hierarchy for images
-            img_queries = [seg["keywords"], f"{destination} {seg.get('description', '').split()[0]}".strip(), f"{destination} travel"]
+            img_queries = [primary_query, fallback_query]
             img_path_local = None
             for q in img_queries:
                 img_path_local = fetch_pexels_image(q, img_path)
@@ -599,7 +606,6 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
             if img_path_local:
                 try:
                     img_clip = ImageClip(img_path_local)
-                    # Crop to portrait aspect ratio
                     img_ratio = img_clip.w / img_clip.h
                     target_ratio = REEL_W / REEL_H
                     if img_ratio > target_ratio:
@@ -609,7 +615,6 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
                         new_h = int(img_clip.w / target_ratio)
                         img_clip = crop(img_clip, height=new_h, y_center=img_clip.h/2)
                     img_clip = resize(img_clip, (REEL_W, REEL_H))
-                    # Apply Ken Burns zoom
                     visual_clip = apply_ken_burns(img_clip, seg_duration, zoom_ratio=1.1)
                     print(f"[INFO] Using image with Ken Burns effect for segment {i}")
                 except Exception as e:
@@ -621,7 +626,6 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
             print(f"[WARN] All visual attempts failed for segment {i}. Using color fallback.")
             visual_clip = ColorClip(size=(REEL_W, REEL_H), color=(15, 15, 30)).set_duration(seg_duration)
         else:
-            # Ensure clip is properly timed and cropped
             if visual_clip.duration < seg_duration:
                 loops = int(seg_duration / visual_clip.duration) + 1
                 visual_clip = concatenate_videoclips([visual_clip] * loops)
@@ -630,7 +634,6 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
                 visual_clip = crop_to_portrait(visual_clip)
             visual_clip = visual_clip.without_audio()
 
-        # Dark overlay for text readability
         overlay = ColorClip(size=(REEL_W, REEL_H), color=(0, 0, 0)).set_opacity(0.45).set_duration(seg_duration)
         clips.append(CompositeVideoClip([visual_clip, overlay], size=(REEL_W, REEL_H)))
 
@@ -706,12 +709,12 @@ def main():
         build_video(data, audio_path, DESTINATION, video_path)
 
         caption = (
-            f"✨ {DESTINATION} awaits you with Sky Suffer Tourism! ✨\n\n"
+            f"✨ {DESTINATION} awaits you with Skysafar Tourism! ✨\n\n"
             f"{data.get('viral_line', '')}\n\n"
             f"Discover the magic of {DESTINATION} — from breathtaking landscapes to rich culture.\n\n"
             f"📞 Contact us: 9654100207\n"
             f"📌 Save this reel and start planning your next adventure!\n\n"
-            f"#SkySafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
+            f"#SkysafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
         )
         send_video_telegram(video_path, caption)
         print("\n✅ Done! Reel sent to Telegram.")
