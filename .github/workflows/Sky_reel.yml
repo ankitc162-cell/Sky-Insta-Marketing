@@ -7,6 +7,10 @@ on:
         required: true
         type: string
         default: 'Bhutan'
+      audience_type:
+        description: 'Target audience (couples, friends, luxury travelers, general travelers)'
+        required: false
+        default: 'general travelers'
 
 permissions:
   contents: write
@@ -39,6 +43,7 @@ jobs:
         # FIX: OPENAI_API_KEY added so ChatGPT fallback actually works
         env:
           DESTINATION: ${{ github.event.inputs.destination }}
+          AUDIENCE_TYPE: ${{ github.event.inputs.audience_type }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
