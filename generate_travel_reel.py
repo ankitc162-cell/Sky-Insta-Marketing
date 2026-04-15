@@ -3,7 +3,8 @@ Travel Destination Reel Generator
 - Accepts destination name + optional audience type as CLI args
 - Generates story-driven Hindi voiceover with scroll-stopping hook via Gemini TTS (Erinome)
 - Fetches Pexels video clips with cinematic keyword hints (disk cached)
-- Builds 9:16 reel with semi-transparent destination overlay + company logo at end
+- Falls back to Pexels images with Ken Burns zoom if videos fail
+- Builds 9:16 reel with semi-transparent destination overlay + company logo throughout
 - Mixes viral-style background music at 15% volume
 - Sends final video to Telegram
 - Falls back to ChatGPT if Gemini text generation fails
@@ -132,7 +133,7 @@ def _build_prompt(destination: str, audience_type: str) -> str:
         "  - Example: 'Yeh sirf ek jagah nahi, ek ehsaas hai jo zindagi bhar yaad rahega'\n\n"
 
         "CTA (urgent + emotional, NOT just functional):\n"
-        "  - Pehle urgency/FOMO: 'offers limited hain — aur aisi jagah baar-baar nahi milti...'\n"
+        "  - Pehle urgency/FOMO: 'Seats limited hain — aur aisi jagah baar-baar nahi milti...'\n"
         f"  - Phir: 'Abhi contact karein Sky Suffer Tourism Private Limited ko 9654100207 par aur book karein apna dream trip {destination} ka!'\n\n"
 
         "  - Total script 160-180 words. Natural, flowing Hindi. Hook included in word count.\n\n"
@@ -233,24 +234,11 @@ def load_bg_music(duration: float):
         print(f"[WARN] Could not load background music: {e}")
         return None
 
-# --- Pexels Video Fetch (with validation and retry) ---
+# --- Pexels Video Fetch (without validation) ---
 used_video_ids = set()
 
 def _cache_filename(video_id: int, width: int) -> Path:
     return CACHE_DIR / f"{video_id}_{width}.mp4"
-
-def _is_valid_video_file(path: str) -> bool:
-    """Check if video file is playable using ffprobe."""
-    try:
-        import imageio_ffmpeg
-        ffprobe_bin = imageio_ffmpeg.get_ffmpeg_exe().replace("ffmpeg", "ffprobe")
-        result = subprocess.run(
-            [ffprobe_bin, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=10
-        )
-        return "video" in result.stdout
-    except Exception:
-        return False
 
 def fetch_pexels_video(query: str, output_path: str, max_retries: int = 3):
     headers = {"Authorization": PEXELS_API_KEY}
@@ -301,12 +289,9 @@ def fetch_pexels_video(query: str, output_path: str, max_retries: int = 3):
 
         cache_file = _cache_filename(video["id"], chosen_width)
         if cache_file.exists():
-            if _is_valid_video_file(str(cache_file)):
-                print(f"[CACHE HIT] {query} -> {cache_file.name}")
-                shutil.copy2(str(cache_file), output_path)
-                return output_path
-            else:
-                cache_file.unlink(missing_ok=True)
+            print(f"[CACHE HIT] {query} -> {cache_file.name}")
+            shutil.copy2(str(cache_file), output_path)
+            return output_path
 
         print(f"[INFO] Downloading: {query} -> {chosen['link'][:60]}... (ID: {video['id']})")
         try:
@@ -315,21 +300,59 @@ def fetch_pexels_video(query: str, output_path: str, max_retries: int = 3):
             with open(output_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
+            shutil.copy2(output_path, str(cache_file))
+            print(f"[CACHE SAVE] {cache_file.name}")
+            return output_path
         except Exception as e:
             print(f"[WARN] Download failed for video {video['id']}: {e}")
             continue
 
-        if not _is_valid_video_file(output_path):
-            os.remove(output_path)
-            print(f"[WARN] Video {video['id']} is corrupt, trying next candidate...")
-            continue
-
-        shutil.copy2(output_path, str(cache_file))
-        print(f"[CACHE SAVE] {cache_file.name}")
-        return output_path
-
     print(f"[ERROR] All candidate videos for '{query}' failed. Returning None.")
     return None
+
+# --- Pexels Image Fetch (for fallback) ---
+used_image_ids = set()
+
+def fetch_pexels_image(query: str, output_path: str):
+    headers = {"Authorization": PEXELS_API_KEY}
+    for orientation in ["portrait", "landscape"]:
+        params = {"query": query, "per_page": 10, "orientation": orientation, "size": "large"}
+        try:
+            resp = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers=headers, params=params, timeout=15
+            )
+            resp.raise_for_status()
+            photos = resp.json().get("photos", [])
+            if photos:
+                break
+        except Exception as e:
+            print(f"[WARN] Pexels photo search failed for '{query}': {e}")
+            continue
+
+    if not photos:
+        print(f"[WARN] No images found for '{query}'")
+        return None
+
+    # Filter out used IDs
+    available = [p for p in photos if p["id"] not in used_image_ids]
+    if not available:
+        available = photos
+
+    photo = random.choice(available[:5])
+    used_image_ids.add(photo["id"])
+    image_url = photo["src"]["original"]
+    print(f"[INFO] Downloading image: {query} -> {image_url[:60]}... (ID: {photo['id']})")
+    try:
+        r = requests.get(image_url, timeout=30, stream=True)
+        r.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return output_path
+    except Exception as e:
+        print(f"[WARN] Image download failed: {e}")
+        return None
 
 # --- Voiceover Generation ---
 def generate_voiceover(script: str, output_path: str = "voiceover.mp3") -> str:
@@ -487,6 +510,25 @@ def crop_to_portrait(clip):
         clip  = crop(clip, height=new_h, y_center=clip.h / 2)
     return resize(clip, (REEL_W, REEL_H))
 
+def apply_ken_burns(clip, duration, zoom_ratio=1.1):
+    """Apply a subtle zoom-in effect to an image clip."""
+    def make_frame(t):
+        # Zoom from 1.0 to zoom_ratio over duration
+        scale = 1 + (zoom_ratio - 1) * t / duration
+        frame = clip.get_frame(t)
+        from PIL import Image
+        import numpy as np
+        pil_img = Image.fromarray(frame)
+        new_w = int(clip.w * scale)
+        new_h = int(clip.h * scale)
+        resized = pil_img.resize((new_w, new_h), PIL.Image.LANCZOS)
+        # Crop center to original size
+        left = (new_w - clip.w) // 2
+        top = (new_h - clip.h) // 2
+        cropped = resized.crop((left, top, left + clip.w, top + clip.h))
+        return np.array(cropped)
+    return VideoFileClip(None).set_duration(duration).fl(make_frame)
+
 # --- Video Assembly ---
 def build_video(data: dict, audio_path: str, destination: str, output_path: str = "reel.mp4") -> str:
     voiceover    = AudioFileClip(audio_path)
@@ -496,50 +538,101 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
     seg_duration = duration / n
     print(f"[INFO] Duration: {duration:.1f}s | {n} segments x {seg_duration:.1f}s each")
 
-    clip_paths = []
-    clips      = []
+    clips = []
+    temp_files = []
 
     for i, seg in enumerate(segments):
         clip_path = f"clip_{i}.mp4"
-        clip_paths.append(clip_path)
+        img_path  = f"img_{i}.jpg"
+        temp_files.append(clip_path)
+        temp_files.append(img_path)
 
+        visual_clip = None
+
+        # Attempt 1: Primary video query
         pexels_path = fetch_pexels_video(seg["keywords"], clip_path)
-
-        if not pexels_path:
-            spot_hint = seg.get("description", "").split()[0] if seg.get("description") else ""
-            fallback1 = f"{destination} {spot_hint}".strip()
-            print(f"[INFO] Segment {i} primary failed. Trying: '{fallback1}'")
-            pexels_path = fetch_pexels_video(fallback1, clip_path)
-
-        if not pexels_path:
-            fallback2 = f"{destination} travel"
-            print(f"[INFO] Still no clip. Trying: '{fallback2}'")
-            pexels_path = fetch_pexels_video(fallback2, clip_path)
-
-        raw = None
         if pexels_path:
             try:
-                raw = VideoFileClip(pexels_path)
-                raw.get_frame(0)
-                if raw.duration < seg_duration:
-                    loops = int(seg_duration / raw.duration) + 1
-                    raw = concatenate_videoclips([raw] * loops)
-                raw = raw.subclip(0, seg_duration)
-                raw = crop_to_portrait(raw).without_audio()
+                visual_clip = VideoFileClip(pexels_path)
+                visual_clip.get_frame(0)  # test validity
             except Exception as e:
-                print(f"[WARN] Clip {i} processing failed: {e}, using color fallback")
-                try:
-                    if raw:
-                        raw.close()
-                except:
-                    pass
-                raw = ColorClip(size=(REEL_W, REEL_H), color=(15, 15, 30)).set_duration(seg_duration)
-        else:
-            print(f"[WARN] All destination‑specific queries failed for segment {i}. Using color clip.")
-            raw = ColorClip(size=(REEL_W, REEL_H), color=(15, 15, 30)).set_duration(seg_duration)
+                print(f"[WARN] Video clip {i} unplayable: {e}")
+                visual_clip = None
 
+        # Attempt 2: Fallback video query with destination + spot
+        if not visual_clip:
+            spot_hint = seg.get("description", "").split()[0] if seg.get("description") else ""
+            fallback1 = f"{destination} {spot_hint}".strip()
+            print(f"[INFO] Segment {i} video failed. Trying fallback query: '{fallback1}'")
+            pexels_path = fetch_pexels_video(fallback1, clip_path)
+            if pexels_path:
+                try:
+                    visual_clip = VideoFileClip(pexels_path)
+                    visual_clip.get_frame(0)
+                except Exception as e:
+                    print(f"[WARN] Fallback video unplayable: {e}")
+                    visual_clip = None
+
+        # Attempt 3: Last video fallback: destination + "travel"
+        if not visual_clip:
+            fallback2 = f"{destination} travel"
+            print(f"[INFO] Still no video. Trying: '{fallback2}'")
+            pexels_path = fetch_pexels_video(fallback2, clip_path)
+            if pexels_path:
+                try:
+                    visual_clip = VideoFileClip(pexels_path)
+                    visual_clip.get_frame(0)
+                except Exception as e:
+                    print(f"[WARN] Last video fallback unplayable: {e}")
+                    visual_clip = None
+
+        # Attempt 4: Image fallback
+        if not visual_clip:
+            print(f"[INFO] All video attempts failed. Fetching image for segment {i}.")
+            # Try the same query hierarchy for images
+            img_queries = [seg["keywords"], f"{destination} {seg.get('description', '').split()[0]}".strip(), f"{destination} travel"]
+            img_path_local = None
+            for q in img_queries:
+                img_path_local = fetch_pexels_image(q, img_path)
+                if img_path_local:
+                    break
+            if img_path_local:
+                try:
+                    img_clip = ImageClip(img_path_local)
+                    # Crop to portrait aspect ratio
+                    img_ratio = img_clip.w / img_clip.h
+                    target_ratio = REEL_W / REEL_H
+                    if img_ratio > target_ratio:
+                        new_w = int(img_clip.h * target_ratio)
+                        img_clip = crop(img_clip, width=new_w, x_center=img_clip.w/2)
+                    else:
+                        new_h = int(img_clip.w / target_ratio)
+                        img_clip = crop(img_clip, height=new_h, y_center=img_clip.h/2)
+                    img_clip = resize(img_clip, (REEL_W, REEL_H))
+                    # Apply Ken Burns zoom
+                    visual_clip = apply_ken_burns(img_clip, seg_duration, zoom_ratio=1.1)
+                    print(f"[INFO] Using image with Ken Burns effect for segment {i}")
+                except Exception as e:
+                    print(f"[WARN] Image processing failed: {e}")
+                    visual_clip = None
+
+        # Last resort: color clip
+        if not visual_clip:
+            print(f"[WARN] All visual attempts failed for segment {i}. Using color fallback.")
+            visual_clip = ColorClip(size=(REEL_W, REEL_H), color=(15, 15, 30)).set_duration(seg_duration)
+        else:
+            # Ensure clip is properly timed and cropped
+            if visual_clip.duration < seg_duration:
+                loops = int(seg_duration / visual_clip.duration) + 1
+                visual_clip = concatenate_videoclips([visual_clip] * loops)
+            visual_clip = visual_clip.subclip(0, seg_duration)
+            if visual_clip.size != (REEL_W, REEL_H):
+                visual_clip = crop_to_portrait(visual_clip)
+            visual_clip = visual_clip.without_audio()
+
+        # Dark overlay for text readability
         overlay = ColorClip(size=(REEL_W, REEL_H), color=(0, 0, 0)).set_opacity(0.45).set_duration(seg_duration)
-        clips.append(CompositeVideoClip([raw, overlay], size=(REEL_W, REEL_H)))
+        clips.append(CompositeVideoClip([visual_clip, overlay], size=(REEL_W, REEL_H)))
 
     base_video = concatenate_videoclips(clips, method="compose")
 
@@ -575,10 +668,10 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
             clip.close()
         except:
             pass
-    for path in clip_paths:
-        if os.path.exists(path):
-            os.remove(path)
-            print(f"[INFO] Cleaned up temp clip: {path}")
+    for f in temp_files:
+        if os.path.exists(f):
+            os.remove(f)
+            print(f"[INFO] Cleaned up temp file: {f}")
 
     print(f"[INFO] Video built -> {output_path}")
     return output_path
@@ -618,7 +711,7 @@ def main():
             f"Discover the magic of {DESTINATION} — from breathtaking landscapes to rich culture.\n\n"
             f"📞 Contact us: 9654100207\n"
             f"📌 Save this reel and start planning your next adventure!\n\n"
-            f"#SkysafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
+            f"#SkySafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
         )
         send_video_telegram(video_path, caption)
         print("\n✅ Done! Reel sent to Telegram.")
