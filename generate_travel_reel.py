@@ -2,8 +2,8 @@
 Travel Destination Reel Generator
 - Accepts destination name as command-line argument
 - Generates Hindi voiceover covering top attractions using Gemini TTS (Erinome)
-- Fetches unique Pexels video clips for each segment
-- Builds 9:16 reel with destination overlay
+- Fetches unique Pexels video clips for each segment (with disk cache)
+- Builds 9:16 reel with destination overlay + background music
 - Sends final video to Telegram chat
 - Falls back to ChatGPT if Gemini text generation fails
 """
@@ -15,6 +15,8 @@ import time
 import requests
 import random
 import json
+import shutil
+import subprocess
 import openai
 from google import genai
 from google.genai import types
@@ -22,9 +24,12 @@ from pathlib import Path
 from datetime import datetime
 from moviepy.editor import (
     VideoFileClip, ColorClip, CompositeVideoClip,
-    AudioFileClip, concatenate_videoclips, ImageClip
+    AudioFileClip, concatenate_videoclips, ImageClip,
+    CompositeAudioClip
 )
+from moviepy.audio.AudioClip import concatenate_audioclips
 from moviepy.video.fx.all import crop, resize
+from moviepy.audio.fx.all import volumex
 
 # FIX: Patch removed Pillow constant for MoviePy 1.0.3 compatibility
 import PIL.Image
@@ -36,6 +41,15 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 PEXELS_API_KEY = os.environ["PEXELS_API_KEY"]
 REEL_W, REEL_H = 1080, 1920
+
+# Pexels video disk cache — survives across workflow steps within the same job
+CACHE_DIR = Path(os.environ.get("PEXELS_CACHE_DIR", "/tmp/pexels_cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Background music: place a royalty-free .mp3 named bg_music.mp3 in your repo root
+BG_MUSIC_PATH = os.environ.get("BG_MUSIC_PATH", "bg_music.mp3")
+BG_MUSIC_VOLUME = 0.12   # 12% — keeps voiceover dominant
+VOICEOVER_SPEED = 1.10   # 10% faster — natural-sounding, saves ~9s per 100s
 
 # Read destination from command line or env var
 if len(sys.argv) > 1:
@@ -72,7 +86,7 @@ def send_video_telegram(video_path: str, caption: str = ""):
 # --- Script Generation ---
 def _build_prompt(destination: str) -> str:
     return (
-        "Aap ek premium travel company 'Sky Safr Tourism Private Limited' ke liye Instagram Reels scriptwriter hain.\n"
+        "Aap ek premium travel company 'Sky Suffer Tourism Private Limited' ke liye Instagram Reels scriptwriter hain.\n"
         f"Aaj hum destination \"{destination}\" par ek exciting reel banayenge.\n\n"
         f"Ek Hindi voiceover script likho jo {destination} ke top tourist spots, unki khoobsurti, aur wahan jaane ke reasons ko highlight kare.\n"
         "Script exciting aur inviting tone mein honi chahiye, jaise ek tour guide apne guests ko roam karwa raha ho.\n\n"
@@ -80,11 +94,11 @@ def _build_prompt(destination: str) -> str:
         "Sirf valid JSON return karo is exact format mein:\n"
         '{{"script": "Poora voiceover script yahan...", "segments": [{{"description": "Is part mein kya dikhaya ja raha hai", "keywords": "pexels search term in English"}}, ...]}}\n\n'
         "Script rules:\n"
-        f"- Shuru karo: 'Sky Safr Tourism ke saath aaj hum aapko le ja rahe hain {destination} ki yaadgaar yatra par!'\n"
+        f"- Shuru karo: 'Sky Suffer Tourism ke saath aaj hum aapko le ja rahe hain {destination} ki yaadgaar yatra par!'\n"
         f"- {destination} ke 4-6 sabse famous aur beautiful tourist spots ko cover karo.\n"
         "- Har spot ke baare mein 2-3 sentences bolo — uska khaas attraction kya hai, kyun visit karna chahiye.\n"
         "- Exciting adjectives use karo: 'shaandar', 'manmohak', 'adbhut', 'swarg se kam nahi'.\n"
-        "- Ant mein kaho: 'Toh der kis baat ki? Abhi contact karein Sky Safr Tourism Private Limited ko 9654100207 par aur book karein apna dream trip {destination} ka!'\n"
+        f"- Ant mein kaho: 'Toh der kis baat ki? Abhi contact karein Sky Suffer Tourism Private Limited ko 9654100207 par aur book karein apna dream trip {destination} ka!'\n"
         "- Total script 200-250 words. Natural, flowing Hindi.\n\n"
         "Keywords rules:\n"
         "- Har tourist spot ya visual vibe ke liye ek segment banao.\n"
@@ -94,7 +108,6 @@ def _build_prompt(destination: str) -> str:
 def _parse_response(text: str) -> dict:
     """Robustly extract JSON from a response that may contain markdown fences."""
     text = text.strip()
-    # Strip ```json ... ``` or ``` ... ``` fences
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         text = match.group(1).strip()
@@ -104,7 +117,6 @@ def generate_script(destination: str) -> dict:
     prompt = _build_prompt(destination)
     gemini_models = ["gemini-2.0-flash", "gemini-2.5-flash"]
 
-    # Try Gemini models in sequence
     for model in gemini_models:
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
@@ -116,7 +128,6 @@ def generate_script(destination: str) -> dict:
         except Exception as e:
             print(f"[WARN] Gemini {model} failed: {e}")
 
-    # Fallback to ChatGPT
     if not OPENAI_API_KEY:
         raise RuntimeError("All Gemini models failed and OPENAI_API_KEY not set.")
     try:
@@ -138,8 +149,25 @@ def generate_script(destination: str) -> dict:
         print(f"[ERROR] ChatGPT also failed: {e}")
         raise RuntimeError("Both Gemini and ChatGPT failed to generate script.")
 
-# --- Pexels Video Fetch (with deduplication and retry) ---
+# --- Pexels Video Fetch (disk cache + deduplication + robust frame validation) ---
 used_video_ids = set()
+
+def _cache_filename(video_id: int, width: int) -> Path:
+    return CACHE_DIR / f"{video_id}_{width}.mp4"
+
+def _is_valid_clip(path: str) -> bool:
+    """
+    FIX: Open the clip AND decode frame 0 — catches broken/truncated containers
+    that VideoFileClip() alone won't reject.
+    """
+    try:
+        clip = VideoFileClip(path)
+        clip.get_frame(0)
+        clip.close()
+        return True
+    except Exception as e:
+        print(f"[WARN] Clip validation failed for {path}: {e}")
+        return False
 
 def fetch_pexels_video(query: str, output_path: str, max_retries: int = 2):
     headers = {"Authorization": PEXELS_API_KEY}
@@ -159,7 +187,7 @@ def fetch_pexels_video(query: str, output_path: str, max_retries: int = 2):
             except requests.HTTPError as e:
                 if resp.status_code == 429:
                     wait = 5 * (attempt + 1)
-                    print(f"[WARN] Pexels rate limit hit, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
+                    print(f"[WARN] Pexels rate limit hit, retrying in {wait}s...")
                     time.sleep(wait)
                 else:
                     print(f"[WARN] Pexels HTTP error {resp.status_code} for '{query}': {e}")
@@ -176,35 +204,55 @@ def fetch_pexels_video(query: str, output_path: str, max_retries: int = 2):
 
     available = [v for v in videos if v["id"] not in used_video_ids]
     if not available:
-        available = videos  # reuse if all exhausted
+        available = videos
 
-    video = random.choice(available[:5])
-    used_video_ids.add(video["id"])
+    candidates = available[:5]
+    random.shuffle(candidates)
 
-    video_files = sorted(video["video_files"], key=lambda x: x.get("width", 0), reverse=True)
-    chosen = next((v for v in video_files if v.get("width", 0) <= 1920), video_files[0])
-    print(f"[INFO] Downloading: {query} -> {chosen['link'][:60]}... (ID: {video['id']})")
+    for video in candidates:
+        used_video_ids.add(video["id"])
+        video_files = sorted(video["video_files"], key=lambda x: x.get("width", 0), reverse=True)
+        chosen = next((v for v in video_files if v.get("width", 0) <= 1920), video_files[0])
+        chosen_width = chosen.get("width", 0)
 
-    r = requests.get(chosen["link"], timeout=60, stream=True)
-    r.raise_for_status()
-    with open(output_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
+        # --- Check disk cache first ---
+        cache_file = _cache_filename(video["id"], chosen_width)
+        if cache_file.exists():
+            if _is_valid_clip(str(cache_file)):
+                print(f"[CACHE HIT] {query} -> {cache_file.name}")
+                shutil.copy2(str(cache_file), output_path)
+                return output_path
+            else:
+                cache_file.unlink(missing_ok=True)  # stale cache entry
 
-    # FIX: Validate the downloaded file is a real, openable video before returning
-    try:
-        test_clip = VideoFileClip(output_path)
-        test_clip.close()
-    except Exception as e:
-        print(f"[WARN] Downloaded video is invalid ({e}), skipping.")
-        os.remove(output_path)
-        return None
+        # --- Download ---
+        print(f"[INFO] Downloading: {query} -> {chosen['link'][:60]}... (ID: {video['id']})")
+        try:
+            r = requests.get(chosen["link"], timeout=60, stream=True)
+            r.raise_for_status()
+            with open(output_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        except Exception as e:
+            print(f"[WARN] Download failed for video {video['id']}: {e}")
+            continue
 
-    return output_path
+        # --- Validate with frame decode before using ---
+        if not _is_valid_clip(output_path):
+            os.remove(output_path)
+            print(f"[WARN] Video {video['id']} failed frame validation, trying next candidate...")
+            continue
 
-# --- Voiceover Generation (Gemini TTS - Erinome) ---
+        # --- Save to disk cache ---
+        shutil.copy2(output_path, str(cache_file))
+        print(f"[CACHE SAVE] {cache_file.name}")
+        return output_path
+
+    print(f"[WARN] All candidates failed for '{query}'")
+    return None
+
+# --- Voiceover Generation (Gemini TTS - Erinome, sped up) ---
 def generate_voiceover(script: str, output_path: str = "voiceover.mp3") -> str:
-    import subprocess
     import imageio_ffmpeg
 
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -231,26 +279,57 @@ def generate_voiceover(script: str, output_path: str = "voiceover.mp3") -> str:
 
     raw_path = output_path.replace(".mp3", ".raw")
     wav_path = output_path.replace(".mp3", ".wav")
+    sped_wav_path = output_path.replace(".mp3", "_sped.wav")
+
+    ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
 
     with open(raw_path, "wb") as f:
         f.write(audio_data)
 
-    ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+    # Raw PCM -> WAV
     subprocess.run([
         ffmpeg_bin, "-y",
         "-f", "s16le", "-ar", "24000", "-ac", "1",
-        "-i", raw_path,
-        wav_path
+        "-i", raw_path, wav_path
     ], check=True, capture_output=True)
+
+    # Speed up using atempo filter
     subprocess.run([
-        ffmpeg_bin, "-y", "-i", wav_path, output_path
+        ffmpeg_bin, "-y", "-i", wav_path,
+        "-filter:a", f"atempo={VOICEOVER_SPEED}",
+        sped_wav_path
     ], check=True, capture_output=True)
 
-    os.remove(raw_path)
-    os.remove(wav_path)
+    # Sped WAV -> MP3
+    subprocess.run([
+        ffmpeg_bin, "-y", "-i", sped_wav_path, output_path
+    ], check=True, capture_output=True)
 
-    print(f"[INFO] Gemini TTS voiceover (Erinome) saved -> {output_path}")
+    for p in [raw_path, wav_path, sped_wav_path]:
+        if os.path.exists(p):
+            os.remove(p)
+
+    print(f"[INFO] Gemini TTS voiceover (Erinome, {VOICEOVER_SPEED}x) saved -> {output_path}")
     return output_path
+
+# --- Background Music ---
+def load_bg_music(duration: float):
+    """Load bg_music.mp3, loop to fill duration, return quietened clip or None."""
+    if not os.path.exists(BG_MUSIC_PATH):
+        print(f"[WARN] No background music at '{BG_MUSIC_PATH}', skipping.")
+        return None
+    try:
+        music = AudioFileClip(BG_MUSIC_PATH)
+        if music.duration < duration:
+            loops = int(duration / music.duration) + 1
+            music = concatenate_audioclips([music] * loops)
+        music = music.subclip(0, duration)
+        music = volumex(music, BG_MUSIC_VOLUME)
+        print(f"[INFO] BG music loaded, looped to {duration:.1f}s at {int(BG_MUSIC_VOLUME*100)}% volume")
+        return music
+    except Exception as e:
+        print(f"[WARN] Could not load background music: {e}")
+        return None
 
 # --- Video Assembly ---
 def make_text_image(text, fontsize, color, stroke_color="black", stroke_width=3):
@@ -294,8 +373,8 @@ def crop_to_portrait(clip):
     return resize(clip, (REEL_W, REEL_H))
 
 def build_video(data: dict, audio_path: str, destination: str, output_path: str = "reel.mp4") -> str:
-    audio = AudioFileClip(audio_path)
-    duration = audio.duration
+    voiceover = AudioFileClip(audio_path)
+    duration = voiceover.duration
     segments = data["segments"]
     n = len(segments)
     seg_duration = duration / n
@@ -308,7 +387,6 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
         clip_path = f"clip_{i}.mp4"
         clip_paths.append(clip_path)
 
-        # FIX: Retry with a broader fallback keyword if first fetch failed
         pexels_path = fetch_pexels_video(seg["keywords"], clip_path)
         if not pexels_path:
             fallback_keyword = seg["keywords"].split(",")[0].split()[0]
@@ -319,6 +397,7 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
         if pexels_path:
             try:
                 raw = VideoFileClip(pexels_path)
+                raw.get_frame(0)  # double-check inside build too
                 if raw.duration < seg_duration:
                     loops = int(seg_duration / raw.duration) + 1
                     looped = concatenate_videoclips([raw] * loops)
@@ -327,9 +406,12 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
                 raw = raw.subclip(0, seg_duration)
                 raw = crop_to_portrait(raw).without_audio()
             except Exception as e:
-                print(f"[WARN] Clip {i} failed: {e}, using color fallback")
-                if raw:
-                    raw.close()
+                print(f"[WARN] Clip {i} failed in build: {e}, using color fallback")
+                try:
+                    if raw:
+                        raw.close()
+                except Exception:
+                    pass
                 raw = ColorClip(size=(REEL_W, REEL_H), color=(15, 15, 30)).set_duration(seg_duration)
         else:
             raw = ColorClip(size=(REEL_W, REEL_H), color=(15, 15, 30)).set_duration(seg_duration)
@@ -339,9 +421,14 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
 
     base_video = concatenate_videoclips(clips, method="compose")
     overlays = make_destination_overlay(destination, duration)
+
+    # Mix voiceover + background music
+    bg_music = load_bg_music(duration)
+    final_audio = CompositeAudioClip([voiceover, bg_music]) if bg_music else voiceover
+
     final = (
         CompositeVideoClip([base_video] + overlays, size=(REEL_W, REEL_H))
-        .set_audio(audio)
+        .set_audio(final_audio)
         .set_duration(duration)
     )
     final.write_videofile(
@@ -354,11 +441,16 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
         ]
     )
 
-    audio.close()
+    voiceover.close()
+    if bg_music:
+        bg_music.close()
     final.close()
     base_video.close()
     for clip in clips:
-        clip.close()
+        try:
+            clip.close()
+        except Exception:
+            pass
 
     for path in clip_paths:
         if os.path.exists(path):
@@ -397,11 +489,11 @@ def main():
         build_video(data, audio_path, DESTINATION, video_path)
 
         caption = (
-            f"✨ {DESTINATION} awaits you with Sky Safr Tourism! ✨\n\n"
+            f"✨ {DESTINATION} awaits you with Sky Suffer Tourism! ✨\n\n"
             f"Discover the magic of {DESTINATION} — from breathtaking landscapes to rich culture.\n\n"
             f"📞 Contact us: 9654100207\n"
             f"📌 Save this reel and start planning your next adventure!\n\n"
-            f"#SkySafrTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
+            f"#SkySafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
         )
         send_video_telegram(video_path, caption)
         print("\n✅ Done! Reel sent to Telegram.")
