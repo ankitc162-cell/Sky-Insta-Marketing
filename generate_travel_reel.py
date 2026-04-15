@@ -3,6 +3,7 @@ Travel Destination Reel Generator
 - Accepts destination name + optional audience type as CLI args
 - Generates fast-paced Hindi voiceover with many segments via Gemini TTS (Erinome)
 - Fetches multiple destination-specific Pexels video clips per segment (concatenated)
+- Verifies clip relevance: Pexels metadata first, Gemini Vision fallback
 - Falls back to destination-specific Pexels images with Ken Burns zoom
 - Builds 9:16 reel with destination overlay + logo
 - Mixes viral background music at 15% volume
@@ -49,7 +50,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 BG_MUSIC_PATH   = os.environ.get("BG_MUSIC_PATH", "bg_music.mp3")
 BG_MUSIC_VOLUME = 0.15
-VOICEOVER_SPEED = 1.10
+VOICEOVER_SPEED = 1.20          # increased for ~60s reels
 LOGO_PATH       = os.environ.get("LOGO_PATH", "logo.png")
 
 VIRAL_MUSIC_OPTIONS = [
@@ -67,6 +68,9 @@ else:
     if not DESTINATION:
         print("ERROR: Provide destination as argument or DESTINATION env var.")
         sys.exit(1)
+
+# Cache for verification results (video_id -> bool)
+VERIFY_CACHE = {}
 
 # --- Telegram Sender ---
 def send_video_telegram(video_path: str, caption: str = ""):
@@ -91,7 +95,7 @@ def send_video_telegram(video_path: str, caption: str = ""):
         print(f"[ERROR] Telegram send failed: {e}")
         return False
 
-# --- Script Generation (more segments, energetic) ---
+# --- Script Generation (adjusted for ~60s) ---
 def _build_prompt(destination: str, audience_type: str) -> str:
     return (
         "Aap ek premium travel company 'Sky Suffer Tourism Private Limited' ke liye viral Instagram Reels scriptwriter hain.\n"
@@ -114,18 +118,18 @@ def _build_prompt(destination: str, audience_type: str) -> str:
         f"  - Example: 'Kya aapne kabhi aisi jagah dekhi hai jahan...?'\n"
         f"  - THEN: 'Sky Suffer Tourism ke saath aaj hum aapko le ja rahe hain {destination}!'\n\n"
 
-        f"CONTENT: {destination} ke 10-14 sabse iconic spots/activities cover karo.\n"
+        f"CONTENT: {destination} ke 8-12 sabse iconic spots/activities cover karo.\n"
         "  - Har spot ke liye 1-2 sentences — fast, exciting.\n"
         "  - Adjectives: 'shaandar', 'adbhut', 'hairan kar dene wala', 'jaaduī'.\n\n"
 
         "CTA (urgent):\n"
         "  - 'Offers limited — abhi contact karein Sky Suffer Tourism: 9654100207'\n\n"
 
-        "  - Total script 180-220 words. Fast-paced Hindi.\n\n"
+        "  - Total script 170-190 words. Fast-paced Hindi.\n\n"
 
         "=== KEYWORDS RULES ===\n"
-        "  - Har segment ke liye EXACT landmark name in English (e.g., 'Paro Taktsang', 'Punakha Dzong').\n"
-        "  - 12-16 segments total.\n"
+        "  - Har segment ke liye EXACT landmark name in English (e.g., 'Bali Tegallalang Rice Terrace').\n"
+        "  - 8-12 segments total.\n"
         "  - Keywords MUST be specific to {destination}.\n"
     )
 
@@ -204,16 +208,83 @@ def load_bg_music(duration: float):
         print(f"[WARN] Could not load BG music: {e}")
         return None
 
-# --- Helper: Destination-prefixed query ---
+# --- Destination Query Helper ---
 def build_query(base: str, dest: str) -> str:
     if dest.lower() in base.lower():
         return base
     return f"{dest} {base}".strip()
 
-# --- Pexels Video Fetch (returns list of paths for multiple clips) ---
+# --- Video Verification (metadata first, Gemini fallback) ---
+def verify_video_metadata(video_data: dict, destination: str, expected_landmark: str) -> bool:
+    """Check if Pexels metadata contains destination or landmark keywords."""
+    try:
+        text_fields = []
+        if "url" in video_data:
+            text_fields.append(video_data["url"])
+        if "user" in video_data and "name" in video_data["user"]:
+            text_fields.append(video_data["user"]["name"])
+        if "video_files" in video_data:
+            for vf in video_data["video_files"]:
+                if "link" in vf:
+                    text_fields.append(vf["link"])
+
+        combined = " ".join(text_fields).lower()
+        dest_lower = destination.lower()
+        landmark_words = expected_landmark.lower().split()
+        # Check for destination or first significant word of landmark (length > 3)
+        if dest_lower in combined or any(word in combined for word in landmark_words if len(word) > 3):
+            print(f"[VERIFY-META] Metadata contains destination/landmark → ACCEPT")
+            return True
+        else:
+            print(f"[VERIFY-META] Metadata lacks relevant keywords → fallback to Gemini")
+            return False
+    except Exception as e:
+        print(f"[WARN] Metadata verification error: {e}, falling back to Gemini")
+        return False
+
+def verify_video_content_gemini(video_path: str, expected_landmark: str, destination: str) -> bool:
+    """Use Gemini Vision as secondary verification."""
+    try:
+        from PIL import Image
+        clip = VideoFileClip(video_path)
+        frame = clip.get_frame(0)
+        clip.close()
+        img = Image.fromarray(frame)
+
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = f"Does this image show {expected_landmark} in {destination}? Answer only 'yes' or 'no'."
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=[prompt, img]
+        )
+        answer = response.text.strip().lower()
+        print(f"[VERIFY-GEMINI] '{expected_landmark}': {answer}")
+        return answer == 'yes'
+    except Exception as e:
+        print(f"[WARN] Gemini Vision verification failed: {e}, accepting by default")
+        return True  # Accept if Gemini fails
+
+def is_video_relevant(video_path: str, video_data: dict, expected_landmark: str, destination: str) -> bool:
+    """Check relevance: metadata first, then Gemini fallback."""
+    video_id = video_data["id"]
+    if video_id in VERIFY_CACHE:
+        print(f"[VERIFY-CACHE] Using cached result for {video_id}: {VERIFY_CACHE[video_id]}")
+        return VERIFY_CACHE[video_id]
+
+    # 1. Try metadata first
+    if verify_video_metadata(video_data, destination, expected_landmark):
+        VERIFY_CACHE[video_id] = True
+        return True
+
+    # 2. Fallback to Gemini Vision
+    gemini_result = verify_video_content_gemini(video_path, expected_landmark, destination)
+    VERIFY_CACHE[video_id] = gemini_result
+    return gemini_result
+
+# --- Pexels Video Fetch (with verification) ---
 used_video_ids = set()
 
-def fetch_multiple_pexels_videos(query: str, count: int = 3, max_retries: int = 2) -> list:
+def fetch_multiple_pexels_videos(query: str, destination: str, count: int = 3, max_retries: int = 2) -> list:
     headers = {"Authorization": PEXELS_API_KEY}
     videos = []
     for orientation in ["portrait", "landscape"]:
@@ -242,10 +313,11 @@ def fetch_multiple_pexels_videos(query: str, count: int = 3, max_retries: int = 
     if len(available) < count:
         available = videos
     random.shuffle(available)
-    selected = available[:count]
 
     downloaded = []
-    for video in selected:
+    for video in available:
+        if len(downloaded) >= count:
+            break
         used_video_ids.add(video["id"])
         video_files = sorted(video["video_files"], key=lambda x: x.get("width", 0), reverse=True)
         chosen = next((v for v in video_files if v.get("width", 0) <= 1920), video_files[0])
@@ -255,27 +327,32 @@ def fetch_multiple_pexels_videos(query: str, count: int = 3, max_retries: int = 
         if cache_file.exists():
             shutil.copy2(str(cache_file), output_path)
             print(f"[CACHE HIT] {query} -> {cache_file.name}")
-            downloaded.append(output_path)
-            continue
+        else:
+            print(f"[INFO] Downloading: {query} -> {chosen['link'][:60]}... (ID: {video['id']})")
+            try:
+                r = requests.get(chosen["link"], timeout=60, stream=True)
+                r.raise_for_status()
+                with open(output_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                shutil.copy2(output_path, str(cache_file))
+            except Exception as e:
+                print(f"[WARN] Download failed: {e}")
+                continue
 
-        print(f"[INFO] Downloading: {query} -> {chosen['link'][:60]}... (ID: {video['id']})")
-        try:
-            r = requests.get(chosen["link"], timeout=60, stream=True)
-            r.raise_for_status()
-            with open(output_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            shutil.copy2(output_path, str(cache_file))
+        # Verify relevance
+        if is_video_relevant(output_path, video, query, destination):
             downloaded.append(output_path)
-        except Exception as e:
-            print(f"[WARN] Download failed: {e}")
+        else:
+            print(f"[REJECT] Video {video['id']} not relevant to {query}")
+            os.remove(output_path)
 
     return downloaded
 
 # --- Pexels Image Fetch (fallback) ---
 used_image_ids = set()
 
-def fetch_pexels_image(query: str, output_path: str) -> str:
+def fetch_pexels_image(query: str, destination: str, output_path: str) -> str:
     headers = {"Authorization": PEXELS_API_KEY}
     for orientation in ["portrait", "landscape"]:
         params = {"query": query, "per_page": 10, "orientation": orientation, "size": "large"}
@@ -345,10 +422,10 @@ def generate_voiceover(script: str, output_path: str = "voiceover.mp3") -> str:
 
     for p in [raw_path, wav_path, sped_path]:
         if os.path.exists(p): os.remove(p)
-    print(f"[INFO] Voiceover saved -> {output_path}")
+    print(f"[INFO] Voiceover saved -> {output_path} ({VOICEOVER_SPEED}x speed)")
     return output_path
 
-# --- Segment Duration Estimation (Word-Weight Fallback) ---
+# --- Segment Duration Estimation ---
 def estimate_segment_durations(data: dict, total_duration: float) -> list:
     segments = data["segments"]
     script = data["script"]
@@ -370,7 +447,6 @@ def estimate_segment_durations(data: dict, total_duration: float) -> list:
         print(f"[WARN] Word-weight failed ({e}), using equal split")
         return [total_duration / n] * n
 
-# --- Whisper‑based Segment Duration Alignment ---
 def get_segment_durations_from_whisper(audio_path: str, data: dict, total_duration: float) -> list:
     try:
         import whisper
@@ -478,7 +554,6 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
     segments = data["segments"]
     n = len(segments)
 
-    # Use Whisper to get per‑segment durations (or word‑weight fallback)
     seg_durations = get_segment_durations_from_whisper(audio_path, data, duration)
 
     print(f"[INFO] {n} segments, durations: {[f'{d:.1f}s' for d in seg_durations]}")
@@ -493,7 +568,7 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
         query = build_query(base_keywords, destination)
         print(f"[INFO] Segment {i}: '{query}' ({seg_duration:.1f}s)")
 
-        video_paths = fetch_multiple_pexels_videos(query, count=3)
+        video_paths = fetch_multiple_pexels_videos(query, destination, count=3)
         segment_clips = []
         for vp in video_paths:
             try:
@@ -516,7 +591,7 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
         else:
             print(f"[INFO] No videos, trying image for '{query}'")
             img_path = f"img_{i}.jpg"
-            img_local = fetch_pexels_image(query, img_path)
+            img_local = fetch_pexels_image(query, destination, img_path)
             if img_local:
                 temp_files.append(img_local)
                 try:
@@ -587,7 +662,7 @@ def main():
             f"Discover the magic of {DESTINATION} — from breathtaking landscapes to rich culture.\n\n"
             f"📞 Contact us: 9654100207\n"
             f"📌 Save this reel and start planning your next adventure!\n\n"
-            f"#SkysafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
+            f"#SkySafarTourism #{DESTINATION.replace(' ', '')} #Travel #Wanderlust"
         )
         send_video_telegram(video_path, caption)
         print("\n✅ Done! Reel sent to Telegram.")
