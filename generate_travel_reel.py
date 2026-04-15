@@ -6,6 +6,7 @@ Travel Destination Reel Generator
 - Falls back to destination-specific Pexels images with Ken Burns zoom
 - Builds 9:16 reel with destination overlay + logo
 - Mixes viral background music at 15% volume
+- Uses Whisper for audio‑aligned segment durations (perfect sync)
 - Sends final video to Telegram
 - Falls back to ChatGPT if Gemini text generation fails
 """
@@ -213,7 +214,6 @@ def build_query(base: str, dest: str) -> str:
 used_video_ids = set()
 
 def fetch_multiple_pexels_videos(query: str, count: int = 3, max_retries: int = 2) -> list:
-    """Fetch up to `count` unique videos for the given query."""
     headers = {"Authorization": PEXELS_API_KEY}
     videos = []
     for orientation in ["portrait", "landscape"]:
@@ -240,7 +240,7 @@ def fetch_multiple_pexels_videos(query: str, count: int = 3, max_retries: int = 
 
     available = [v for v in videos if v["id"] not in used_video_ids]
     if len(available) < count:
-        available = videos  # allow reuse if needed
+        available = videos
     random.shuffle(available)
     selected = available[:count]
 
@@ -348,6 +348,61 @@ def generate_voiceover(script: str, output_path: str = "voiceover.mp3") -> str:
     print(f"[INFO] Voiceover saved -> {output_path}")
     return output_path
 
+# --- Segment Duration Estimation (Word-Weight Fallback) ---
+def estimate_segment_durations(data: dict, total_duration: float) -> list:
+    segments = data["segments"]
+    script = data["script"]
+    n = len(segments)
+    try:
+        words = script.split()
+        total_words = len(words)
+        chunk_size = total_words // n
+        counts = []
+        for i in range(n):
+            start = i * chunk_size
+            end = start + chunk_size if i < n - 1 else total_words
+            counts.append(max(end - start, 1))
+        total = sum(counts)
+        durations = [total_duration * (c / total) for c in counts]
+        print(f"[INFO] Word-weighted durations: {[f'{d:.1f}s' for d in durations]}")
+        return durations
+    except Exception as e:
+        print(f"[WARN] Word-weight failed ({e}), using equal split")
+        return [total_duration / n] * n
+
+# --- Whisper‑based Segment Duration Alignment ---
+def get_segment_durations_from_whisper(audio_path: str, data: dict, total_duration: float) -> list:
+    try:
+        import whisper
+        print("[INFO] Running Whisper for audio-aligned timestamps...")
+        model = whisper.load_model("tiny")
+        result = model.transcribe(audio_path, language="hi", word_timestamps=True)
+
+        words = []
+        for seg in result["segments"]:
+            for w in seg.get("words", []):
+                words.append((w["start"], w["word"].strip()))
+
+        if not words:
+            raise ValueError("No word timestamps returned by Whisper")
+
+        n = len(data["segments"])
+        chunk_size = len(words) // n
+        cut_times = [0.0]
+        for i in range(1, n):
+            idx = i * chunk_size
+            if idx < len(words):
+                cut_times.append(words[idx][0])
+        cut_times.append(total_duration)
+
+        durations = [max(cut_times[i+1] - cut_times[i], 1.0) for i in range(n)]
+        print(f"[INFO] Whisper-aligned durations: {[f'{d:.1f}s' for d in durations]}")
+        return durations
+
+    except Exception as e:
+        print(f"[WARN] Whisper failed ({e}), falling back to word-weight")
+        return estimate_segment_durations(data, total_duration)
+
 # --- Video Assembly ---
 def make_destination_overlay(destination: str, duration: float):
     from PIL import Image, ImageDraw, ImageFont
@@ -422,18 +477,22 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
     duration = voiceover.duration
     segments = data["segments"]
     n = len(segments)
-    seg_duration = duration / n
-    print(f"[INFO] {n} segments, {seg_duration:.1f}s each")
+
+    # Use Whisper to get per‑segment durations (or word‑weight fallback)
+    seg_durations = get_segment_durations_from_whisper(audio_path, data, duration)
+
+    print(f"[INFO] {n} segments, durations: {[f'{d:.1f}s' for d in seg_durations]}")
 
     clips = []
     temp_files = []
 
     for i, seg in enumerate(segments):
+        seg_duration = seg_durations[i]
+
         base_keywords = seg["keywords"]
         query = build_query(base_keywords, destination)
-        print(f"[INFO] Segment {i}: '{query}'")
+        print(f"[INFO] Segment {i}: '{query}' ({seg_duration:.1f}s)")
 
-        # Try videos first (up to 3 clips concatenated)
         video_paths = fetch_multiple_pexels_videos(query, count=3)
         segment_clips = []
         for vp in video_paths:
@@ -446,18 +505,15 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
                 print(f"[WARN] Video unplayable: {e}")
 
         if segment_clips:
-            # Concatenate available clips for this segment
             if len(segment_clips) > 1:
                 visual = concatenate_videoclips(segment_clips)
             else:
                 visual = segment_clips[0]
-            # Trim or loop to segment duration
             if visual.duration < seg_duration:
                 loops = int(seg_duration / visual.duration) + 1
                 visual = concatenate_videoclips([visual] * loops)
             visual = visual.subclip(0, seg_duration)
         else:
-            # Fallback to image
             print(f"[INFO] No videos, trying image for '{query}'")
             img_path = f"img_{i}.jpg"
             img_local = fetch_pexels_image(query, img_path)
@@ -489,7 +545,6 @@ def build_video(data: dict, audio_path: str, destination: str, output_path: str 
                                          "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                                          "-b:v", "3500k", "-b:a", "128k", "-ar", "44100", "-ac", "2"])
 
-    # Cleanup
     voiceover.close()
     if bg: bg.close()
     final.close()
